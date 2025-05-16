@@ -1,0 +1,214 @@
+---
+title: "NYPD Shooting Incident Data (Historic)"
+output:
+  pdf_document: default
+  html_document: default
+date: "2025-05-05"
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+```
+
+### 1) Get Data from the CSV Version of the Data
+Right-click "Download" button and select "Copy As Link"
+
+```{r get_shootings_data}
+url_in <- "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD"
+```
+
+### 2) Reading the Data from the CSV
+
+```{r import_data, message=FALSE}
+incident_intake <- read_csv(url_in)
+```
+
+### 3) Initial Summary
+
+```{r initial_summary}
+summary(incident_intake)
+```
+
+### 4) Clean Data
+
+```{r transform_data}
+# A. maintaining original dataset in case I need to access columns that I've deleted, assigning transformations to new dataset variable "incidents"
+# B. unite date and time into string, then transform to datetime variable (but keep original date and time variables)
+# C. unite location variables
+# D. delete the following columns: INCIDENT_KEY, X_COORD_CD, Y_COORD_CD, Latitude, Longitude, and Lon_Lat
+incidents <- incident_intake %>%
+  unite("datetime", c(OCCUR_DATE, OCCUR_TIME), sep = " ", remove = FALSE) %>%
+  mutate(datetime = as.POSIXct(datetime, format = "%m/%d/%Y %H:%M")) %>%
+  unite("location", c(LOC_OF_OCCUR_DESC, LOC_CLASSFCTN_DESC, LOCATION_DESC),
+        sep = ", ",
+        na.rm = TRUE) %>%
+  select(-c(INCIDENT_KEY, X_COORD_CD, Y_COORD_CD, Latitude, Longitude, Lon_Lat))
+  
+# D. transform all PERP and VIC variables to factors
+# E. transform OCCUR_DATE to "date" variable
+# F. "round" datetime to minutes since no seconds were included in original OCCUR_TIME variable
+incidents <- incidents %>%
+  mutate(across(PERP_AGE_GROUP:VIC_RACE, as.factor)) %>%
+  mutate(OCCUR_DATE = mdy(OCCUR_DATE))
+```
+
+### 5) Revised Summary
+
+```{r revised_summary}
+summary(incidents)
+```
+
+### 6) Normalizing Missing Data
+There are many types of categorizing missing data within the same column. For instance, the *PER_AGE_GROUP* variable includes "(null)," "UNKNOWN," and "NA"
+
+```{r normalize_missing}
+# change all types of unknown data to "NA"
+incidents <- incidents %>%
+  mutate(across(PERP_AGE_GROUP:VIC_RACE,
+                ~recode(.,
+                        "UNKNOWN" = NA_character_,
+                        "(null)" = NA_character_,
+                        "U" = NA_character_)
+                ))
+```
+
+### 7) Visualize as Bar Graph
+First, I'm interested in seeing how many shootings occurred in each borough
+
+```{r boro_bar_graph}
+# including this part to get the first and last dates for the title
+first_date = min(incidents$OCCUR_DATE)
+last_date = max(incidents$OCCUR_DATE)
+# use paste() to insert first and last dates into title (specifically paste0() so I can manually add spaces between some but not all strings and values)
+ggplot(incidents, aes(x = BORO, fill = BORO)) +
+  geom_bar() +
+  labs(title = "Number of Shooting Incidents by Borough", subtitle = paste0("(from ", first_date, " to ", last_date, ")"),
+       x = "Borough", y = "Shootings Count") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+Analysis: this bar graph shows a significantly higher number of shooting incidents in Brooklyn and the Bronx compared to Manhattan, Queens, and Staten Island. I would be curious to incorporate some measure of population for each borough, which could change the relative importance of these results (e.g.if Brooklyn's average population during this time period was four times higher than that of Manhattan, it would have a proportionally lower number of shootings per x number of people). This bar graph also doesn't incorporate demographic information, some of which (sex, race, and age range for perpetrators and victims) can be found for many entries in the original dataset.
+
+### 8) Visualize as Scatter Plot
+Second, I want to create a scatter plot so I can see shooting incidents per day
+### Part 1:
+I'm going to start by creating dataset variants that calculate the number of shootings per day
+
+```{r incidents_per_day_graph}
+shootings_by_date <- incidents %>%
+  group_by(OCCUR_DATE) %>%
+  summarize(shootings = n()) %>%
+  ungroup()
+```
+
+### Part 2:
+Next I'll create the actual scatter plot
+
+```{r scatter_plots_by_date}
+# starting with scatter plot for combined dataset, with dates having 0 shootings filtered out 
+shootings_by_date %>%
+  filter(shootings > 0) %>%
+  ggplot(aes(x = OCCUR_DATE, y = shootings)) +
+  geom_point(aes(color = "shootings")) +
+  labs(title = "Number of Shooting Incidents by Date", subtitle = paste0("(from ", first_date, " to ", last_date, ")"), x = "Date", y = "Shootings Count") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+It's honestly hard to see what's going on in this plot because of how many dates exist in the dataset. I'm going to try instead looking at shootings per year
+
+```{r scatter_plot_by_year}
+# trying a different method of ungrouping with this function
+shootings_by_year <- shootings_by_date %>%
+  mutate(Year = year(OCCUR_DATE)) %>%
+  group_by(Year) %>%
+  summarize(shootings = sum(shootings), .groups = "drop")
+
+# summarize to see where y-axis values should start and end
+summary(shootings_by_year)
+
+#get first_year and last_year for titles
+first_year <- min(shootings_by_year$Year)
+last_year <- max(shootings_by_year$Year)
+
+shootings_by_year %>%
+  filter(shootings > 0) %>%
+  ggplot(aes(x = Year, y = shootings)) +
+  geom_point(aes(color = "shootings")) +
+  geom_line(aes(color = "shootings")) +
+  labs(title = "Number of Shooting Incidents by Year", subtitle = paste0("(from ", first_year, " to ", last_year, ")"), x = "Year", y = "Shootings Count") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_x_continuous(breaks = seq(2006, 2024, by = 2)) +
+  scale_y_continuous(limits = c(500, 2500))
+```
+
+Analysis: there appears to be a change over time with shooting incidents decreasing from 2006 until 2019, then sharply rising again until 2023. We could dig deeper into certain years and see when during the year shootings increased or decreased, maybe there's a pattern of shootings increasing and decreasing during particular seasons or annual events that can be tracked over multiple years.
+
+### 9) Model Based on Age Group
+I'm curious if there's a correlation between the age group of shooting incident perpetrators and the age range of shooting incident victims.
+
+First, I need to filter to a version of the dataset that only includes incidents where the age ranges of both the perpetrators and victims (1) were reported, and (2) do not appear as error values.
+
+```{r filter_to_age_range}
+allowed_factors <- c("<18","18-24","25-44","45-64","65+")
+age_incidents <- incidents[incidents$PERP_AGE_GROUP %in% allowed_factors & incidents$VIC_AGE_GROUP %in% allowed_factors, ]
+# drop factor levels that were removed from this copy of the dataset
+age_incidents$PERP_AGE_GROUP <- droplevels(age_incidents$PERP_AGE_GROUP)
+age_incidents$VIC_AGE_GROUP <- droplevels(age_incidents$VIC_AGE_GROUP)
+```
+
+Second, I'll convert the age groups to numeric values that can be compared in a linear regression model
+
+```{r ages_to_values}
+# assign values to age group factors
+age_incidents_numeric <- age_incidents %>%
+  mutate(perp_age = case_when(
+    PERP_AGE_GROUP == "<18" ~ 1,
+    PERP_AGE_GROUP == "18-24" ~ 2,
+    PERP_AGE_GROUP == "25-44" ~ 3,
+    PERP_AGE_GROUP == "45-64" ~ 4,
+    PERP_AGE_GROUP == "65+" ~ 5),
+    vic_age = case_when(
+      VIC_AGE_GROUP == "<18" ~ 1,
+      VIC_AGE_GROUP == "18-24" ~ 2,
+      VIC_AGE_GROUP == "25-44" ~ 3,
+      VIC_AGE_GROUP == "45-64" ~ 4,
+      VIC_AGE_GROUP == "65+" ~ 5))
+```
+
+Third, I'll create a linear regression model
+
+```{r create_lm}
+age_model <- lm(vic_age ~ perp_age, data = age_incidents_numeric)
+# include summary
+summary(age_model)
+```
+
+And finally, I'll visualize with a scatter plot
+
+```{r age_model_scatterplot}
+# using "geom_jitter" to provide a better visual for overlapping data points
+# renaming the numeric age groups back to their original age groups for better understanding
+age_incidents_numeric %>%
+  ggplot(aes(x = perp_age, y = vic_age)) +
+  geom_jitter(width = 0.25, height = 0.25, alpha = 0.35) +
+  geom_smooth(method = "lm", color = "red") +
+  scale_x_continuous(breaks = 1:5, labels = c("<18", "18-24", "25-44", "45-64", "65+")) +
+  scale_y_continuous(breaks = 1:5, labels = c("<18", "18-24", "25-44", "45-64", "65+")) +
+  labs(title = "Relationship Between Perpetrator and Victim Age Groups",
+       subtitle = "(with numeric values for age groups)", x = "Perpetrator Age Group", y = "Victim Age Group") +
+  theme_minimal()
+```
+
+Analysis: the results show some level of correlation - perpetrators in both the 18-24 age group and 25-44 age group were primarily associated with victims in the 18-44 age group. But there is not a clear correlation at every age group - <18 perpetrators appear to be associated with more 18-24 victims than any other age group, and 45-64 perpetrators appear to be associated with more 25-44 victims than any other age group. There are clearly shortfalls with not considering other factors such as location, economic status, race, sex, etc.
+
+### 10) Conclusion
+
+Using *NYPD Shooting Incident Data (Historic)*, I attempted to answer a few questions: 1) Which borough has had the largest number of shooting incidents according to this dataset (accomplished with a bar graph), 2) How has the number of shooting incidents per year changed overtime (accomplished with a scatter plot), and 3) Is there a correlation between the age group of shooting incident perpetrators and victims (accomplished with a jittered scatter plot with a linear regression model).
+
+I bring some personal bias into these tasks. For one, because I have lived in New York city, I have some preconceived notions about which boroughs are considered more or less dangerous. Therefore, I might expect to see more shooting incidents in particular boroughs, and could try to display the data in a way that reinforces my assumptions. Rather than going down that path, it is important to not make assumptions about causes behind the bar graph results. As referenced in my analysis, the total number of shooting incidents could have a different significance if factors like population per borough is considered.
+
+Another type of bias is that I'm conditioned to associate any significant change in activity starting around 2019/2020 with COVID19. In regards to my second visualization, the scatter plot of shooting incidents per year, I noticed the abrupt increase in shootings in 2019, followed by a sharp decrease beginning in 2021/2022. My assumption might be that the spike was caused by COVID19 (or more likely a byproduct of COVID19, such as economic instability), but that speculation ignores other possible causes for the change in reported incidents, such as a change in shooting incident reporting procedures by the NYPD.
