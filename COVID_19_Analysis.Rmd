@@ -1,0 +1,361 @@
+---
+title: "COVID 19 Analysis"
+output: html_document
+date: "2025-05-13"
+---
+
+### 0) Install Necessary Packages
+
+```{r setup}
+# use install.packages("<insert pakage name>") command in console if any of the following packages are not already installed
+library(tidyverse)
+library(scales)
+library(car)
+```
+
+### 1) Read in CSV Data from GitHub
+
+```{r read_csvs, message=FALSE}
+# get CSVs from GitHub
+url_start <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/refs/heads/master/csse_covid_19_data/csse_covid_19_time_series/"
+file_names <- c("time_series_covid19_confirmed_global.csv", "time_series_covid19_deaths_global.csv", "time_series_covid19_recovered_global.csv", "time_series_covid19_confirmed_US.csv", "time_series_covid19_deaths_US.csv")
+urls <- str_c(url_start, file_names)
+
+# read data from CSVs
+global_cases_unmod <- read_csv(urls[1])
+global_deaths_unmod <- read_csv(urls[2])
+global_recoveries_unmod <- read_csv(urls[3])
+us_cases_unmod <- read_csv(urls[4])
+us_deaths_unmod <- read_csv(urls[5])
+```
+
+### 2) Clean Up Global Data
+
+Part 1: Reorganize data with one date per row, remove latitude and longitude (unneccessary for my analysis), and change new "Date" variable to date type
+
+```{r clean_global_data}
+# create new datasets with modified data so originals are preserved
+global_cases <- global_cases_unmod %>%
+  pivot_longer(cols = -c('Province/State', 'Country/Region', Lat, Long),
+               names_to = "Date",
+               values_to = "Cases") %>%
+  select(-c(Lat, Long)) %>%
+  mutate(Date = mdy(Date))
+
+global_deaths <- global_deaths_unmod %>%
+  pivot_longer(cols = -c('Province/State', 'Country/Region', Lat, Long),
+               names_to = "Date",
+               values_to = "Deaths") %>%
+  select(-c(Lat, Long)) %>%
+  mutate(Date = mdy(Date))
+
+global_recoveries <- global_recoveries_unmod %>%
+  pivot_longer(cols = -c('Province/State', 'Country/Region', Lat, Long),
+               names_to = "Date",
+               values_to = "Recoveries") %>%
+  select(-c(Lat, Long)) %>%
+  mutate(Date = mdy(Date))
+```
+
+Part 2: Transform global data by combining cases, deaths, and recoveries
+
+```{r combine_global}
+global <- global_cases %>%
+  full_join(global_deaths) %>%
+  full_join(global_recoveries) %>%
+  rename(Province_State = 'Province/State',
+         Country_Region = 'Country/Region')
+
+# show summary
+summary(global)
+```
+
+### 3) Clean Up US Data
+
+Part 1: Reorganize data with one date per row, remove latitude and longitude (unnecessary for my analysis), and change new "Date" variable to date type
+
+
+```{r clean_us_data}
+# create new datasets with modified data so originals are preserved
+us_cases <- us_cases_unmod %>%
+  pivot_longer(cols = -(UID:Combined_Key),
+               names_to = "Date",
+               values_to = "Cases") %>%
+  select(Admin2:Cases) %>%
+  select(-c(Lat, Long_)) %>%
+  mutate(Date = mdy(Date))
+
+# there is an extra "Population" variable in the deaths dataset
+us_deaths <- us_deaths_unmod %>%
+  pivot_longer(cols = -(UID:Population),
+               names_to = "Date",
+               values_to = "Deaths") %>%
+  select(Admin2:Deaths) %>%
+  select(-c(Lat, Long_)) %>%
+  mutate(Date = mdy(Date))
+```
+
+Part 2: Transform US data by combining cases and deaths
+
+```{r combine_us}
+us <- us_cases %>%
+  full_join(us_deaths) %>%
+  # rename "Admin2" variable to "County" for easier identification
+  rename(County = Admin2) %>%
+  # reorder "Deaths" and "Population" variables so that the former comes right after the "Cases" variable
+  relocate(Deaths, .before = Population)
+
+#show summary
+summary(us)
+
+# at time of writing, the following commands show the same three dates with negative numbers of cases and deaths:
+us %>% filter(Cases < 0)
+us %>% filter(Deaths < 0)
+
+# modify dataset to remove these possible errors
+us <- us %>%
+  filter(Cases >= 0)
+```
+
+### 4) Modify Global Data for Easier Comparison with US Data
+
+Part 1: Create new "Combined_Key" variable out of "Province_State" and "Country_Region" variables
+
+```{r combine_location_variables}
+global <- global %>%
+  unite("Combined_Key",
+        c(Province_State, Country_Region),
+        sep = ", ",
+        na.rm = TRUE,
+        remove = FALSE)
+```
+
+Part 2: Add population data from another dataset
+
+```{r add_global_population}
+# import population information from another csv dataset
+global_pop <- read_csv("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/refs/heads/master/csse_covid_19_data/UID_ISO_FIPS_LookUp_Table.csv", show_col_types = FALSE) %>%
+  select(Province_State, Country_Region, Population)
+
+# combine with "global" dataset
+global_w_pop <- global %>%
+  left_join(global_pop, by = c("Province_State", "Country_Region")) %>%
+  select(Province_State, Country_Region, Combined_Key, Date, Cases, Deaths, Recoveries, Population)
+
+# show summary
+summary(global_w_pop)
+```
+
+### 5) How is global COVID 19 data predicted by case rate and recovery rate?
+
+In the lecture, we walked through creating a model that predicted death rate based on case rate. We saw some correlation, but could tell other factors affected the death rate. For global data, we have additional data regarding case recoveries. I will implement a model to see if recovery rates alongside case rates affect the prediction of death rates per country.
+
+Part 1: Create new dataset with total cases, deaths, and recoveries per country, along with associated rates based on population
+
+```{r create_model_dataset}
+# transform data to sum Cases/Deaths/Recoveries/Pop for all Province_State's within each Country_Region for each Date
+global_mod_data <- global_w_pop %>%
+  group_by(Country_Region, Date) %>%
+  summarize(Cases = sum(Cases),
+            Deaths = sum(Deaths),
+            Recoveries = sum(Recoveries),
+            Population = sum(Population)) %>%
+  # transform data again by finding max Cases/Deaths/Recoveries/Pop for each country out of all days
+  group_by(Country_Region) %>%
+  summarize(Cases = max(Cases),
+            Deaths = max(Deaths),
+            Recoveries = max(Recoveries),
+            Population = max(Population),
+            Case_Rate = Cases / Population,
+            Death_Rate = Deaths / Population,
+            Recovery_Rate = Recoveries / Population) %>%
+  # remove rows with 0 Pop (which will affect rates) or 0 Cases (which should equate to no Deaths)
+  filter(Population > 0, Cases > 0) %>%
+  ungroup()
+```
+
+Part 2a: To test our model compared the the one using US data from the lecture, first create and visualize a model that looks at death rates as a function of just case rates
+
+```{r case_model}
+global_mod <- lm(Death_Rate ~ Case_Rate, data = global_mod_data)
+# show summary of model
+summary(global_mod)
+
+# add predictions variable to dataset, based on model
+global_mod_data$Predictions = predict(global_mod)
+```
+
+Part 2b: We'll visualize it two ways, first with a plot similar to the one seen in lecture
+
+```{r vis_mod_1}
+# first plot
+global_mod_data %>% ggplot() +
+  geom_point(aes(x = Case_Rate, y = Death_Rate),
+             color = "blue") +
+  geom_point(aes(x = Case_Rate, y = Predictions),
+             color = "red") +
+  labs(title = "Actual vs. Predicted Death Rate", x = "Case Rate", y = "Death Rate") +
+  scale_x_continuous(labels = label_percent(accuracy = 0.1)) +
+  scale_y_continuous(labels = label_percent(accuracy = 0.1)) +
+  theme_minimal()
+```
+
+Part 2c: The second plot evaluates a perfect prediction of the model against the real data
+
+```{r vis_mod_2}
+ggplot(global_mod_data, aes(x = Death_Rate, y = Predictions)) +
+  geom_point(alpha = 0.4) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  labs(title = "Actual vs. Predicted Death Rate", x = "Actual Death Rate", y = "Predicted Death Rate") +
+  scale_x_continuous(labels = label_percent(accuracy = 0.1)) +
+  scale_y_continuous(labels = label_percent(accuracy = 0.1)) +
+  theme_minimal()
+```
+
+Part 3a: Now introduce recovery rates as an additional predictive factor in the model
+
+```{r case_and_rec_model}
+global_mod <- lm(Death_Rate ~ Case_Rate + Recovery_Rate, data = global_mod_data)
+# show summary of model
+summary(global_mod)
+
+# add predictions variable to dataset, based on model
+global_mod_data$Predictions = predict(global_mod)
+```
+
+Part 3b: Check for multicollinearity between case rate and recovery rate
+
+```{r multicoll_check}
+vif(global_mod)
+```
+
+At the time of this writing, the VIF Factors for both "Case_Rate" and "Recovery_Rate" are under 1.4. Multicollinearity is a topic I am not too familiar with, but based on these sources the VIF Factor for this model does not appear to be dangerously large:
+https://pmc.ncbi.nlm.nih.gov/articles/PMC6900425/;
+https://www.geeksforgeeks.org/multicollinearity-in-data/;
+https://online.stat.psu.edu/stat462/node/180/
+
+Part 3c: First plot with new model
+
+```{r vis_mod_3}
+# first plot
+global_mod_data %>% ggplot() +
+  geom_point(aes(x = Case_Rate, y = Death_Rate),
+             color = "darkgreen") +
+  geom_point(aes(x = Case_Rate, y = Predictions),
+             color = "darkorange") +
+  labs(title = "Actual vs. Predicted Death Rate", x = "Case Rate", y = "Death Rate") +
+  scale_x_continuous(labels = label_percent(accuracy = 0.1)) +
+  scale_y_continuous(labels = label_percent(accuracy = 0.1)) +
+  theme_minimal()
+```
+
+Part 3d: Second plot with new model
+
+```{r vis_mod_4}
+ggplot(global_mod_data, aes(x = Death_Rate, y = Predictions)) +
+  geom_point(alpha = 0.4) +
+  geom_abline(slope = 1, intercept = 0, color = "darkorange") +
+  labs(title = "Actual vs. Predicted Death Rate", x = "Actual Death Rate", y = "Predicted Death Rate") +
+  scale_x_continuous(labels = label_percent(accuracy = 0.1)) +
+  scale_y_continuous(labels = label_percent(accuracy = 0.1)) +
+  theme_minimal()
+```
+
+Analysis: The first graph for the new dataset does appear to show a closer correlation with at between predictions and actuals for at least some data points, although both graphs make it clear that additional factors affect death rates. I might have some bias in guessing that countries with higher recovery rates will have lower death rates, but that might not necessarily be the case. As shown below, the country of Montenegro has the third highest recovery rate but also the sixth highest death rate.
+
+```{r max_recovery_and_death_rates}
+global_mod_data %>% slice_max(Recovery_Rate, n = 10) %>%
+  select(Country_Region, Recovery_Rate, Death_Rate, everything())
+
+global_mod_data %>% slice_max(Death_Rate, n = 10) %>%
+  select(Country_Region, Recovery_Rate, Death_Rate, everything())
+```
+
+### 6) US States with Highest and Lowest Death Rates
+
+For the five US states with the highest overall death rates, I want to find out how the death rate for each of them changes over time. I will then compare that with a similar graph for the five US states with the lowest overall death rates.
+
+Part 1: Calculate death rate over time, grouping by state
+
+```{r rates_over_time}
+us_time_data <- us %>%
+  group_by(Province_State, Country_Region, Date) %>%
+  summarize(Cases = sum(Cases),
+            Deaths = sum(Deaths),
+            Population = sum(Population),
+            Death_Rate = Deaths / Population) %>%
+  filter(Population > 0) %>%
+  ungroup()
+```
+
+Part 2: Calculate overall deaths rates per state
+
+```{r overall_rates}
+us_state_data <- us_time_data %>%
+  group_by(Province_State) %>%
+  summarize(Cases = max(Cases),
+            Deaths = max(Deaths),
+            Population = max(Population),
+            Death_Rate = Deaths / Population) %>%
+  ungroup()
+```
+
+Part 3: Identify the five states with the highest overall death rates and the five states with the lowest overall death rates
+
+```{r identify_high_and_low}
+# five states with highest overall death rates
+us_state_data %>% slice_max(Death_Rate, n = 5)
+
+# five states with lowest overall death rates
+us_state_data %>% slice_min(Death_Rate, n = 5)
+```
+
+At the time of this writing, the five states with the highest overall death rates are (in order from greatest to least):
+1. Arizona
+2. Oklahoma
+3. Mississippi
+4. West Virginia
+5. New Mexico
+
+Meanwhile, the five states with the lowest overall death rates at the time of this writing are (in order from least to greatest):
+1. American Samoa
+2. Northern Mariana Islands
+3. Virgin Islands
+4. Hawaii
+5. Vermont
+
+Part 4a: Visualize change in death rate for five states with the overall highest death rates over time
+
+```{r vis_highest}
+# get list of just five states with highest overall death rate
+max_states <- us_state_data %>%
+  slice_max(Death_Rate, n = 5)
+
+#visualize death rate change over time
+us_time_data %>%
+  filter(Province_State %in% max_states$Province_State) %>%
+  ggplot(aes(x = Date, y = Death_Rate, color = Province_State)) +
+  geom_line(linewidth = 0.5) +
+  labs(title = "Death Rate Over Time for Five States with Highest Overall Death Rates", x = "Date", y = "Death Rate", color = "State") +
+  theme_minimal() +
+  scale_y_continuous(labels = label_percent(accuracy = 0.1))
+```
+
+Part 4b: Visualize change in death rate for five states with the overall lowest death rates over time
+
+```{r vis_lowest}
+# get list of just five states with lowest overall death rate
+min_states <- us_state_data %>%
+  slice_min(Death_Rate, n = 5)
+
+#visualize death rate change over time
+us_time_data %>%
+  filter(Province_State %in% min_states$Province_State) %>%
+  ggplot(aes(x = Date, y = Death_Rate, color = Province_State)) +
+  geom_line(linewidth = 0.5) +
+  labs(title = "Death Rate Over Time for Five States with Lowest Overall Death Rates", x = "Date", y = "Death Rate", color = "State") +
+  theme_minimal() +
+  scale_y_continuous(labels = label_percent(accuracy = 0.1))
+```
+
+Analysis: I was curious to see if the states with the highest overall death rates at any point had death rates lower than those of the states with the lowest overall death rates. Based on the data I can see at the time of this writing, that doesn't appear to be the case. Something I didn't consider when I conceived of this analysis was that many of the lowest states (or territories) would be islands, which could have had a significant impact on how and when COVID spread in those locations.
